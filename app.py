@@ -94,11 +94,18 @@ with st.sidebar:
 
     st.divider()
     st.header("Super Bowl carryover")
-    sb_winner = st.text_input("Last SB winner (abbr)", "")
-    sb_loser = st.text_input("Last SB loser (abbr)", "")
+    from walters.teams import TEAMS as _T
+    _opts = ["(none)"] + sorted(_T)
+    sb_winner = st.selectbox("Last SB winner", _opts, index=0)
+    sb_loser = st.selectbox("Last SB loser", _opts, index=0)
+    sb_winner = "" if sb_winner == "(none)" else sb_winner
+    sb_loser = "" if sb_loser == "(none)" else sb_loser
 
     st.divider()
     st.header("Data sources")
+    use_sonny = st.checkbox("Use Sonny Moore ratings", True,
+        help="Uncheck early season if his page is still last year's final ratings")
+    use_massey = st.checkbox("Use Massey ratings", True)
     use_weather = st.checkbox("Fetch weather (Open-Meteo)", True)
     use_injuries = st.checkbox("Fetch injury reports (ESPN)", True)
     use_splits = st.checkbox("Fetch betting splits (OddsCrowd)", True)
@@ -121,17 +128,19 @@ prog = st.progress(0, "Power ratings…")
 warnings = []
 
 sonny_r = massey_r = None
-try:
-    sonny_r = sonnymoore.fetch()
-except Exception as e:
-    warnings.append(f"Sonny Moore fetch failed: {e}")
-if massey_csv.strip():
-    massey_r = massey.parse_csv(massey_csv)
-else:
+if use_sonny:
     try:
-        massey_r = massey.fetch()
+        sonny_r = sonnymoore.fetch()
     except Exception as e:
-        warnings.append(f"Massey auto-fetch failed ({e}) — CSV fallback available in sidebar.")
+        warnings.append(f"Sonny Moore fetch failed: {e}")
+if use_massey:
+    if massey_csv.strip():
+        massey_r = massey.parse_csv(massey_csv)
+    else:
+        try:
+            massey_r = massey.fetch()
+        except Exception as e:
+            warnings.append(f"Massey auto-fetch failed ({e}) — CSV fallback available in sidebar.")
 prog.progress(20, "Odds…")
 
 odds_lookup = None
@@ -219,6 +228,9 @@ with tab_w:
             "Injuries": r["injury_count"],
         })
     df = pd.DataFrame(rows)
+    df["_absedge"] = df["Edge"].abs()
+    df = df.sort_values("_absedge", ascending=False,
+                        na_position="last").drop(columns="_absedge")
     hide_qb = st.checkbox("High-confidence only (hide QB-injury games)", False)
     view = df[~df["Flags"].str.contains("QB")] if hide_qb else df
     c1, c2, c3 = st.columns(3)
@@ -229,7 +241,7 @@ with tab_w:
                 signal_cols=("Bet",), dim_cols=("Day", "Flags"))
 
     st.subheader("Game detail")
-    for r in results:
+    for r in sorted(results, key=lambda x: -(abs(x["edge"]) if x["edge"] is not None else -1)):
         label = f"{r['away']} @ {r['home']} — Walters {r['walters_home_line']:+.1f}"
         if r["bet_side"]:
             label += f" → BET {r['bet_side']} ({r['edge']:+.1f})"
