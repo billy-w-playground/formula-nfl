@@ -110,10 +110,9 @@ with st.sidebar:
     use_injuries = st.checkbox("Fetch injury reports (ESPN)", True)
     use_splits = st.checkbox("Fetch betting splits (OddsCrowd)", True)
     oc_url = st.text_input(
-        "OddsCrowd data endpoint URL",
-        help="One-time DevTools grab: Network -> Fetch/XHR on the NFL "
-             "spread page, copy the request URL whose response holds "
-             "bets/money percentages.")
+        "OddsCrowd endpoint override (optional)",
+        help="Normally leave blank — the API is built in. Paste a captured "
+             "URL only to pin/debug behavior.")
     odds_key = st.text_input("The Odds API key (optional)", type="password")
     massey_csv = st.text_area("Massey CSV fallback (Team,Rating)", height=100)
 
@@ -161,14 +160,17 @@ prog.progress(50, "Betting splits…")
 splits = {}
 if use_splits:
     try:
-        splits = splits_api.fetch(oc_url.strip())
+        splits = splits_api.fetch(oc_url.strip() or None)
     except Exception as e:
         warnings.append(f"Betting splits failed ({e}). Formula tabs will be "
                         "empty until the OddsCrowd endpoint is configured.")
 prog.progress(65, "Schedule, weather, scoring…")
 
 if not sonny_r and not massey_r:
-    st.error("No ratings source available. Paste a Massey CSV or retry.")
+    for w in warnings:
+        st.warning(w)
+    st.error("No ratings source available. Paste the Massey Export CSV "
+             "in the sidebar or re-enable a source.")
     st.stop()
 
 try:
