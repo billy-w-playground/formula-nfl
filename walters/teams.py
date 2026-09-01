@@ -172,9 +172,10 @@ def resolve(name: str) -> str | None:
     key = name.strip().upper()
     if key in NAME_TO_ABBR:
         return NAME_TO_ABBR[key]
-    for full, abbr in NAME_TO_ABBR.items():
-        if full in key or key in full:
-            return abbr
+    if len(key) >= 4:  # short codes must match exactly; fuzzy is unsafe
+        for full, abbr in NAME_TO_ABBR.items():
+            if full in key or key in full:
+                return abbr
     return None
 
 
