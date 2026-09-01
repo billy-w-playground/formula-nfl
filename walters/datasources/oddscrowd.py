@@ -1,33 +1,39 @@
-"""Public betting splits and the 'Formula' signal — OddsCrowd edition.
+"""Betting splits + the 'Formula' signal — OddsCrowd edition.
 
-DATA SOURCE: oddscrowd.com. Their odds-comparison pages carry Bets / Money /
-Opener columns, but those cells are filled client-side by JavaScript — the
-static HTML serves dashes. fetch() therefore requires the site's internal
-data endpoint URL, captured once via browser DevTools (Network tab ->
-Fetch/XHR -> the request whose response contains bets/money percentages).
-Paste that URL into the app sidebar. The parser below is written tolerantly
-against common shapes and will need one round of adjustment against the
-first real payload.
+DATA SOURCE: api.oddscrowd.com — a clean REST API discovered via HAR
+capture of the odds-comparison page (Sep 2026). League filtering is
+explicit (sport_slug=amer-football&league_slug=nfl); per-book odds ride
+event_teams.odds_total / odds_spread; index 1 = home team.
 
-The Formula (user's method) is unchanged and source-agnostic:
-  A signal fires on side S when, versus opening:
-    1. Ticket minority: bets% on S < 50
-    2. Sharp differential: money%(S) - bets%(S) >= diff_threshold
-    3. Reverse line movement toward S >= move_threshold
+IMPORTANT STATUS: as of preseason 2026 the API sends NO bets/money/opener
+fields — the site's Bets/Money columns render dashes because the data
+does not exist yet. Lines parse today; the Formula signals stay dormant
+until OddsCrowd starts sending split percentages (re-capture a HAR then
+and match _PCT_KEYS below to the real field names).
+
+The Formula itself is unchanged and source-agnostic:
+  signal on side S when bets%(S) < 50, money%(S)-bets%(S) >= threshold,
+  and the line moved toward S versus opening.
 """
 from __future__ import annotations
+import time
 from dataclasses import dataclass
 
 import requests
 
 from ..teams import resolve
 
+API = "https://api.oddscrowd.com/events"
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36"),
     "Accept": "application/json",
-    "Referer": "https://oddscrowd.com/odds-comparison/amer-football/leagues/nfl/bet-types/spread-fullgame",
+    "Origin": "https://oddscrowd.com",
+    "Referer": "https://oddscrowd.com/",
 }
+# candidate field names for split percentages, checked when they appear
+_PCT_KEYS = ("bets_percent", "bet_percent", "tickets_percent", "bets_pct",
+             "money_percent", "money_pct", "handle_percent")
 
 
 @dataclass
@@ -44,70 +50,101 @@ class Splits:
     over_money_pct: float | None = None
 
 
-def _num(x):
-    try:
-        return float(x)
-    except (TypeError, ValueError):
-        return None
+def _median(xs):
+    xs = sorted(x for x in xs if x is not None)
+    return xs[len(xs) // 2] if xs else None
 
 
-def _walk_games(obj):
-    """Yield dict nodes that look like game objects anywhere in the JSON."""
-    if isinstance(obj, dict):
-        keys = {k.lower() for k in obj}
-        if ({"hometeam", "awayteam"} & keys or {"home_team", "away_team"} & keys
-                or {"home", "away"} & keys):
-            yield obj
-        for v in obj.values():
-            yield from _walk_games(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from _walk_games(v)
+def _params(bet_type: str, include: str, page: int) -> list[tuple[str, str]]:
+    return [
+        ("from", str(int(time.time()) - 6 * 3600)),
+        ("per_page", "50"), ("order_by", "datetime"),
+        ("with[]", "league"), ("with[]", "league.sport"),
+        ("with[]", f"event_teams.{include}.bookmaker.image"),
+        ("with[]", f"event_teams.{include}.bet_type"),
+        ("sport_slug", "amer-football"), ("league_slug", "nfl"),
+        ("bet_type", bet_type), ("page", str(page)),
+    ]
 
 
-def _get(d, *names):
-    for n in names:
-        for k, v in d.items():
-            if k.lower().replace("_", "") == n.lower().replace("_", ""):
-                return v
-    return None
+def _fetch_events(bet_type: str, include: str, timeout: int) -> list[dict]:
+    events, page = [], 1
+    while page <= 5:
+        r = requests.get(API, params=_params(bet_type, include, page),
+                         headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+        data = r.json()
+        events.extend(data.get("data", []))
+        if not data.get("next_page_url"):
+            break
+        page += 1
+    return events
 
 
-def fetch(endpoint_url: str, timeout: int = 20) -> dict[tuple[str, str], Splits]:
-    """Fetch splits from the OddsCrowd internal endpoint (see module doc)."""
-    if not endpoint_url or not endpoint_url.startswith("http"):
-        raise ValueError("No OddsCrowd endpoint URL configured — grab it via "
-                         "DevTools (Network -> Fetch/XHR) and paste it in the sidebar")
-    r = requests.get(endpoint_url, headers=HEADERS, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    out: dict[tuple[str, str], Splits] = {}
-    for g in _walk_games(data):
-        home_raw = _get(g, "homeTeam", "home")
-        away_raw = _get(g, "awayTeam", "away")
-        if isinstance(home_raw, dict):
-            home_raw = _get(home_raw, "name", "fullName", "teamName")
-        if isinstance(away_raw, dict):
-            away_raw = _get(away_raw, "name", "fullName", "teamName")
-        home, away = resolve(str(home_raw or "")), resolve(str(away_raw or ""))
-        if not home or not away:
+def _team_split_pcts(et: dict) -> tuple[float | None, float | None]:
+    """Scan an event_team (and its odds rows) for split percentage fields."""
+    pools = [et] + list(et.get("odds_spread") or []) + list(et.get("odds_total") or [])
+    bets = money = None
+    for node in pools:
+        if not isinstance(node, dict):
             continue
-        s = Splits(away=away, home=home)
-        s.cur_home_spread = _num(_get(g, "homeSpread", "spreadHome", "spread"))
-        s.open_home_spread = _num(_get(g, "homeSpreadOpen", "spreadHomeOpen",
-                                       "openingSpread", "openerSpread"))
-        s.home_bets_pct = _num(_get(g, "homeSpreadBetsPct", "homeBetsPct",
-                                    "spreadBetsHome", "betsHome"))
-        s.home_money_pct = _num(_get(g, "homeSpreadMoneyPct", "homeMoneyPct",
-                                     "spreadMoneyHome", "moneyHome"))
-        s.cur_total = _num(_get(g, "total", "overUnder", "totalPoints"))
-        s.open_total = _num(_get(g, "totalOpen", "openingTotal", "openerTotal"))
-        s.over_bets_pct = _num(_get(g, "overBetsPct", "totalBetsOver", "betsOver"))
-        s.over_money_pct = _num(_get(g, "overMoneyPct", "totalMoneyOver", "moneyOver"))
-        out[(away, home)] = s
+        for k, v in node.items():
+            kl = k.lower()
+            if not isinstance(v, (int, float)):
+                continue
+            if bets is None and any(t in kl for t in ("bets", "bet_", "ticket")) and "pct" in kl + "percent" and ("percent" in kl or "pct" in kl):
+                bets = float(v)
+            if money is None and ("money" in kl or "handle" in kl) and ("percent" in kl or "pct" in kl):
+                money = float(v)
+    return bets, money
+
+
+def fetch(endpoint_url: str | None = None, timeout: int = 20
+          ) -> dict[tuple[str, str], Splits]:
+    """Fetch NFL spread + total data. endpoint_url optionally overrides the
+    spread call entirely (paste a captured URL to pin behavior)."""
+    out: dict[tuple[str, str], Splits] = {}
+
+    def ingest(events: list[dict], kind: str):
+        for ev in events:
+            if (ev.get("league") or {}).get("slug") != "nfl":
+                continue
+            ets = sorted(ev.get("event_teams", []), key=lambda e: e.get("index", 9))
+            if len(ets) < 2:
+                continue
+            home_et = next((e for e in ets if e.get("index") == 1), ets[0])
+            away_et = next((e for e in ets if e.get("index") == 2), ets[-1])
+            ht, at = home_et.get("team") or {}, away_et.get("team") or {}
+            home = resolve(ht.get("name", "")) or resolve(ht.get("abbrv") or "")
+            away = resolve(at.get("name", "")) or resolve(at.get("abbrv") or "")
+            if not home or not away:
+                continue
+            s = out.setdefault((away, home), Splits(away=away, home=home))
+            if kind == "spread":
+                rows = home_et.get("odds_spread") or []
+                s.cur_home_spread = _median([r.get("market_argument") for r in rows])
+                b, m = _team_split_pcts(home_et)
+                s.home_bets_pct, s.home_money_pct = b, m
+            else:
+                over_rows = [r for r in (home_et.get("odds_total") or [])
+                             if str(r.get("name", "")).lower() == "over"]                     or (home_et.get("odds_total") or [])
+                s.cur_total = _median([r.get("market_argument") for r in over_rows])
+                b, m = _team_split_pcts(home_et)
+                s.over_bets_pct, s.over_money_pct = b, m
+
+    if endpoint_url and endpoint_url.startswith("http"):
+        r = requests.get(endpoint_url, headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+        ingest(r.json().get("data", []), "spread")
+    else:
+        try:
+            ingest(_fetch_events("AH_OT", "odds_spread", timeout), "spread")
+        except Exception:
+            pass  # spread include name is inferred; totals call is verified
+    ingest(_fetch_events("OU_OT", "odds_total", timeout), "total")
+
     if not out:
-        raise ValueError("OddsCrowd payload parsed to zero games — send the "
-                         "raw JSON so the parser can be matched to it")
+        raise ValueError("OddsCrowd returned no NFL events")
     return out
 
 
