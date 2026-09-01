@@ -113,16 +113,30 @@ def fetch(timeout: int = 20) -> dict[str, float]:
 
 
 def parse_csv(text: str) -> dict[str, float]:
-    """Fallback: parse a pasted Team,Rating CSV."""
+    """Fallback paste parser. Accepts either a simple Team,Rating CSV or
+    Massey's own Export file (header row: Team,,Rec,,Rat,,Pwr,... where the
+    power VALUE sits one column after the 'Pwr' rank column)."""
+    text = text.lstrip("\ufeff").strip()
+    rows = list(csv.reader(io.StringIO(text)))
+    if not rows:
+        return {}
+    val_idx = None  # None => simple mode (last column)
+    header = [c.strip().lower() for c in rows[0]]
+    if "pwr" in header:
+        val_idx = header.index("pwr") + 1
+        rows = rows[1:]
+    elif "team" in header:
+        rows = rows[1:]
     out: dict[str, float] = {}
-    for row in csv.reader(io.StringIO(text.strip())):
+    for row in rows:
         if len(row) < 2:
             continue
         abbr = resolve(row[0])
-        try:
-            rating = float(row[-1])
-        except ValueError:
+        if not abbr:
             continue
-        if abbr:
-            out[abbr] = rating
+        try:
+            rating = float(row[val_idx] if val_idx is not None else row[-1])
+        except (ValueError, IndexError):
+            continue
+        out[abbr] = rating
     return out
